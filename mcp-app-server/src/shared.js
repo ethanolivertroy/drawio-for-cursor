@@ -295,8 +295,9 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
       <button id="zoom-in-btn" class="icon-only" style="display:none" title="Zoom in" aria-label="Zoom in">
         <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="6" x2="12" y2="18"/><line x1="6" y1="12" x2="18" y2="12"/></svg>
       </button>
-      <button id="zoom-fit-btn" class="icon-only" style="display:none" title="Fit to view" aria-label="Fit to view">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 8 4 4 8 4"/><polyline points="16 4 20 4 20 8"/><polyline points="4 16 4 20 8 20"/><polyline points="16 20 20 20 20 16"/><rect x="8" y="9" width="8" height="6" rx="1"/></svg>
+      <button id="zoom-fit-btn" class="icon-only" style="display:none" title="Zoom in" aria-label="Zoom in">
+        <svg id="zoom-fit-icon-zoomin" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/><line x1="15.5" y1="15.5" x2="20" y2="20"/></svg>
+        <svg id="zoom-fit-icon-fit" viewBox="0 0 24 24" aria-hidden="true" style="display:none"><polyline points="4 8 4 4 8 4"/><polyline points="16 4 20 4 20 8"/><polyline points="4 16 4 20 8 20"/><polyline points="16 20 20 20 20 16"/><rect x="8" y="9" width="8" height="6" rx="1"/></svg>
       </button>
       <button id="open-drawio" title="Open this diagram in draw.io to edit" aria-label="Open in draw.io">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"/><path d="M10 14L20 4"/><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"/></svg>
@@ -955,7 +956,15 @@ var app = new App({ name: "draw.io Diagram Viewer", version: "1.0.0" });
 function applyDisplayModeLayout()
 {
   var ctx = (app.getHostContext != null) ? app.getHostContext() : null;
-  currentDisplayMode = (ctx != null && ctx.displayMode) || 'inline';
+  var newMode = (ctx != null && ctx.displayMode) || 'inline';
+  // Detect mode transitions BEFORE writing currentDisplayMode so the
+  // fit/reset block below knows whether this hostcontextchanged was a
+  // real inline↔fullscreen transition or just an inset/viewport tweak
+  // (Claude.ai fires hostcontextchanged on scroll as safeAreaInsets
+  // shift around its prompt overlay — without this guard the camera
+  // would re-fit and dblclickZoomedIn would reset on every wheel tick).
+  var modeChanged = (newMode !== currentDisplayMode);
+  currentDisplayMode = newMode;
 
   var insetBottom = 0;
   if (ctx != null && ctx.safeAreaInsets && typeof ctx.safeAreaInsets.bottom === 'number')
@@ -988,15 +997,17 @@ function applyDisplayModeLayout()
     fullscreenBtn.setAttribute('aria-label', 'Toggle fullscreen');
   }
 
-  // Re-fit the camera so the diagram tracks the new layout. Snap-fit
-  // (immediate=true) — user-initiated layout change should feel
-  // instant, not animated. Skip if the graph isn't built yet.
-  if (streamGraph != null) streamFollowNewCells(streamGraph, true);
-  // Display mode change effectively re-fits the diagram, so reset the
-  // dblclick toggle to "not zoomed in" — otherwise the first dblclick
-  // after exiting fullscreen would try to zoom out (no-op) instead of
-  // zooming in.
-  dblclickZoomedIn = false;
+  // Re-fit the camera + reset dblclick state ONLY on a real mode
+  // transition. Otherwise the user's manual zoom/pan would be wiped
+  // by every host-context update (scroll, inset shifts, etc.).
+  // Snap-fit (immediate=true) — user-initiated mode change should
+  // feel instant, not animated.
+  if (modeChanged)
+  {
+    if (streamGraph != null) streamFollowNewCells(streamGraph, true);
+    dblclickZoomedIn = false;
+    updateZoomFitButtonUi();
+  }
 }
 
 /**
@@ -3549,6 +3560,7 @@ function endStreaming()
   currentLayoutState = 'none';
   if (layoutBtn != null) layoutBtn.style.display = 'none';
   dblclickZoomedIn = false;
+  updateZoomFitButtonUi();
   recentVertexQueue = [];
   lastBatchSize = 0;
   viewTransform = { scale: 1, tx: 0, ty: 0 };
@@ -3876,6 +3888,7 @@ function enableViewerInteractivity(graph)
         customZoomToScaleAt(pxD, pyD, target);
         dblclickZoomedIn = true;
       }
+      updateZoomFitButtonUi();
       lastClickT = 0;
       return; // suppress drag start for the second click
     }
@@ -4489,6 +4502,30 @@ function applyLayoutChange(targetState)
   }
 }
 
+// Sync the zoom/fit toolbar button's icon + title with dblclickZoomedIn.
+// dblclickZoomedIn=false → button offers "zoom in"; true → offers "fit".
+function updateZoomFitButtonUi()
+{
+  var iconZoomIn = document.getElementById('zoom-fit-icon-zoomin');
+  var iconFit = document.getElementById('zoom-fit-icon-fit');
+  var btn = document.getElementById('zoom-fit-btn');
+  if (btn == null) return;
+  if (dblclickZoomedIn)
+  {
+    if (iconZoomIn) iconZoomIn.style.display = 'none';
+    if (iconFit) iconFit.style.display = '';
+    btn.setAttribute('title', 'Fit to view');
+    btn.setAttribute('aria-label', 'Fit to view');
+  }
+  else
+  {
+    if (iconZoomIn) iconZoomIn.style.display = '';
+    if (iconFit) iconFit.style.display = 'none';
+    btn.setAttribute('title', 'Zoom in');
+    btn.setAttribute('aria-label', 'Zoom in');
+  }
+}
+
 function customFitView()
 {
   if (streamGraph == null) return;
@@ -4498,6 +4535,7 @@ function customFitView()
   // click zooms IN regardless of who just fitted (Fit button, dblclick
   // zoom-out, or display-mode change).
   dblclickZoomedIn = false;
+  updateZoomFitButtonUi();
   // Animate to fit-whole via the affine-fixed-point rAF helper so the
   // path is a clean zoom (no CSS-decomposition curve). Bypasses
   // streamFollowNewCells, which uses a CSS transition.
@@ -5069,10 +5107,24 @@ document.getElementById('zoom-out-btn').addEventListener('click', function()
   customZoomBy(1 / 1.5);
 });
 
+// 2-state toggle mirroring the dblclick behavior: when fitted (initial
+// state) zoom in toward the container center; when zoomed in, fit.
 document.getElementById('zoom-fit-btn').addEventListener('click', function()
 {
-  customFitView();
-  dblclickZoomedIn = false;
+  if (streamGraph == null) return;
+  if (dblclickZoomedIn)
+  {
+    customFitView();
+    return;
+  }
+  var rect = containerEl.getBoundingClientRect();
+  var px = rect.width / 2;
+  var py = rect.height / 2;
+  var fitS = fitWholeScale();
+  var target = (fitS >= 0.999) ? 2.0 : 1.0;
+  customZoomToScaleAt(px, py, target);
+  dblclickZoomedIn = true;
+  updateZoomFitButtonUi();
 });
 
 // Layout toggle: as-authored ↔ alternative (horizontal or vertical,
@@ -5107,9 +5159,18 @@ document.addEventListener('visibilitychange', function()
 // flex 1 1 auto on the container, so its clientHeight changes with the
 // window without triggering a host-context-changed. Snap-fit so the
 // camera tracks the resize instantly.
+//
+// EXCEPT when the user has explicitly zoomed in (dblclickZoomedIn).
+// Claude.ai resizes the iframe in response to scroll / sendSizeChanged
+// feedback after layout; without this gate, every such resize wipes
+// the user's zoom state without flipping the Fit button icon (the
+// resize path doesn't touch dblclickZoomedIn). The user can hit Fit
+// to refit on demand.
 window.addEventListener('resize', function()
 {
-  if (streamGraph != null) streamFollowNewCells(streamGraph, true);
+  if (streamGraph == null) return;
+  if (dblclickZoomedIn) return;
+  streamFollowNewCells(streamGraph, true);
 });
 
 app.connect().then(function()
