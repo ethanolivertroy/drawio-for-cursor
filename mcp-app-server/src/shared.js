@@ -440,7 +440,7 @@ function healPartialXml(partialXml)
   // Strip XML comments to avoid confusing the tag scanner.
   // Comments may span multiple lines and contain '<' or '>'.
   // Also remove any incomplete comment at the end (opened but not closed).
-  var stripped = xml.replace(/<!--[\s\S]*?-->/g, '').replace(/<!--[\s\S]*$/, '');
+  var stripped = xml.replace(/<!--[\\s\\S]*?-->/g, '').replace(/<!--[\\s\\S]*$/, '');
 
   // Track open tags using a simple stack-based approach.
   // We scan for opening and closing tags, ignoring self-closing ones.
@@ -558,11 +558,11 @@ function isContainerVertex(cell)
   // Generic drawio container marker
   if (s.indexOf('container=1') >= 0) return true;
   // Bare shape token: "swimlane;..." or "...;group;..."
-  if (/(?:^|;)\s*(?:swimlane|group)\s*(?:;|$)/.test(s)) return true;
+  if (/(?:^|;)\\s*(?:swimlane|group)\\s*(?:;|$)/.test(s)) return true;
   // shape=anything-with-group / anything-with-swimlane: catches AWS
   // group shapes (mxgraph.aws4.group, mxgraph.aws4.groupCenter, …)
   // that don't carry container=1 explicitly.
-  if (/(?:^|;)\s*shape\s*=\s*[^;]*(?:group|swimlane)/i.test(s)) return true;
+  if (/(?:^|;)\\s*shape\\s*=\\s*[^;]*(?:group|swimlane)/i.test(s)) return true;
   return false;
 }
 
@@ -2806,7 +2806,7 @@ function parseTranslate(node)
   if (raw == null || raw === '' || raw === 'none') return { x: 0, y: 0 };
 
   // Computed value format: "Xpx", "Xpx Ypx", or "Xpx Ypx Zpx".
-  var parts = raw.split(/\s+/);
+  var parts = raw.split(/\\s+/);
   var x = parseFloat(parts[0]);
   var y = (parts.length > 1) ? parseFloat(parts[1]) : 0;
 
@@ -4593,7 +4593,7 @@ function readVisibleTransform(svg)
   var t;
   try { t = window.getComputedStyle(svg).transform; } catch (_) { return null; }
   if (!t || t === 'none') return null;
-  var m = t.match(/matrix\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+)\s*\)/);
+  var m = t.match(/matrix\\(\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+),\\s*([^,]+)\\s*\\)/);
   if (!m) return null;
   var a = parseFloat(m[1]);
   var b = parseFloat(m[2]);
