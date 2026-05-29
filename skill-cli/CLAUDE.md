@@ -1,6 +1,6 @@
 # Skill + CLI
 
-Claude Code skill that generates native `.drawio` files, with optional export to PNG/SVG/PDF (with embedded XML) using the draw.io desktop CLI. No MCP server required.
+Claude Code skill that generates native `.drawio` files, with optional export to PNG/SVG/PDF (with embedded XML) using the draw.io desktop CLI, or a browser URL that opens the diagram directly at `app.diagrams.net`. No MCP server required.
 
 ## Key Files
 
@@ -14,10 +14,17 @@ Claude Code skill that generates native `.drawio` files, with optional export to
 1. User invokes `/drawio` or Claude detects a diagram request
 2. Claude generates mxGraphModel XML for the requested diagram
 3. The XML is written to a `.drawio` file in the working directory via the Write tool
-4. If the user requested an export format (png, svg, pdf), the draw.io CLI exports to `.drawio.png` / `.drawio.svg` / `.drawio.pdf` with `--embed-diagram`, then deletes the source `.drawio` file
-5. The result is opened for viewing (`open` / `xdg-open` / `start`)
+4. Format-specific handling:
+   - **png/svg/pdf** — the draw.io CLI exports to `.drawio.png` / `.drawio.svg` / `.drawio.pdf` with `--embed-diagram`, then deletes the source `.drawio` file
+   - **url** — a `node -e` one-liner reads the `.drawio` file, compresses it with `zlib.deflateRawSync` + base64, builds `https://app.diagrams.net/?...#create={type,compressed,data}`, and opens it in the browser. The `.drawio` file is kept for persistence.
+   - **default** — no extra step, the `.drawio` file is the output
+5. The result is opened for viewing (`open` / `xdg-open` / `start`; on Windows/WSL2, `url` mode uses a temp `.url` file because `cmd.exe` strips the `#create=...` fragment)
 
-Default output is `.drawio` (no export). The user requests export by mentioning a format: `/drawio png ...`, `/drawio svg: ...`, etc.
+Default output is `.drawio` (no export). The user requests another output mode by mentioning the format: `/drawio png ...`, `/drawio svg: ...`, `/drawio url ...`, etc.
+
+## URL Mode Compatibility
+
+The `url` mode produces the exact same `https://app.diagrams.net/#create=...` URL format as the MCP Tool Server (`mcp-tool-server/src/index.js`). Node.js's built-in `zlib.deflateRawSync` and `pako.deflateRaw` both implement RFC 1951, so their outputs are interchangeable. No external npm dependencies are added to the skill — only Node.js built-ins (`zlib`, `child_process`, `fs`, `os`, `path`).
 
 ## draw.io CLI Locations
 
