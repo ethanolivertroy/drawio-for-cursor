@@ -1,19 +1,23 @@
 # ELK Layout Vendor
 
-Two artifacts are vendored here:
+One artifact is vendored here:
 
-- `drawio-elk.min.js` — ESM bundle from drawio-elk's `dist/elk.min.js`.
-  Exports `default` (ELK engine class) plus `ElkLayout`, `ElkAdapter`,
-  `ElkApplier` (the mxGraph ↔ ELK bridge). build-html.js wraps it in
-  an IIFE and aliases all four to `globalThis.{ELK,ElkLayout,
-  ElkAdapter,ElkApplier}` so the inlined viewer scripts see them as
-  bare globals (`new ELK()`, `new ElkLayout(...)`, etc.).
-- `mxElkLayout.js` — thin compatibility shim that preserves the
-  historical `buildElkGraph` / `applyElkLayout` API used by
-  shared.js's postLayout flow. Internally delegates to `ElkAdapter` +
-  `ElkApplier` from the bundle. The original (~400-line) flat-mode
-  adapter has been retired — the bundle's bridge does hierarchical
-  (compound) conversion, matching drawio-dev.
+- `drawio-elk.min.js` — the IIFE bundle from drawio-elk's
+  `dist/elk.bundled.js`. Defines `var ELK` (engine class) plus
+  `ElkLayout` / `ElkAdapter` / `ElkApplier` (the mxGraph ↔ ELK bridge),
+  all exposed as bare globals so the inlined viewer scripts can call
+  `new ELK()`, `new ElkLayout(...)`, etc. `processElkBundle` in
+  `shared.js` passes the IIFE through unchanged (it only strips exports
+  when handed the ESM build).
+
+`ElkLayout` is the single source of truth for the layout pipeline,
+the per-algorithm `DEFAULTS`, the `MENU_PRESETS` (name → algorithm +
+direction) and the `CANONICAL_EDGE` treatment (`edgeStyleMode` +
+`corners`). The MCP's postLayout pass (`applyPostLayout` in
+`shared.js`) drives it directly via `new ElkLayout(...).prepare(...)`
+— there is no separate `mxElkLayout` shim anymore (removed when the
+postLayout flow was migrated onto the facade, matching drawio-dev's
+editor routes).
 
 Vendored to keep this repo self-contained — see issue #29.
 
@@ -31,18 +35,18 @@ To inspect the version of the vendored copy:
 head -1 drawio-elk.min.js
 ```
 
-`mxElkLayout.js` has no banner — it's a thin mxGraph adapter.
-
 ## Refreshing
 
-Build the ESM bundle in the drawio-elk repo and copy:
+Build the bundle in the drawio-elk repo and copy the IIFE artifact:
 
 ```sh
 cd ../../drawio-elk
 npm run build
-cp dist/elk.min.js ../drawio-mcp/mcp-app-server/vendor/elk/drawio-elk.min.js
+cp dist/elk.bundled.js ../drawio-mcp/mcp-app-server/vendor/elk/drawio-elk.min.js
 ```
 
-The `mxElkLayout.js` shim only needs updating if the bridge's API
-changes (it currently uses `ElkAdapter.convert` /
-`ElkAdapter.getElkToCellMap` / `ElkApplier.apply`).
+Copy the same `dist/elk.bundled.js` into drawio-dev
+(`src/main/webapp/js/elk/drawio-elk.min.js`) so the editor and the MCP
+run a byte-identical engine + bridge. After refreshing, rebuild the
+Worker bundle (`npm run build:worker`) so `generated-html.js` picks up
+the new inlined copy.

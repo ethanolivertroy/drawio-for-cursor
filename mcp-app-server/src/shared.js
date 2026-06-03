@@ -18,8 +18,7 @@ import { normalizeDiagramXml, INVALID_DIAGRAM_XML_MESSAGE } from "./normalize-di
  * @param {string} mermaidJs - The drawio-mermaid IIFE bundle. Exposes `mxMermaidToDrawio.parseText(text, config)`. Reads `globalThis.ELK` on init — caller must inline `elkJs` first.
  * @param {object} [options] - Optional configuration.
  * @param {string} [options.viewerJs] - If provided, inlines this JS instead of loading viewer-static.min.js from CDN.
- * @param {string} [options.elkJs] - The drawio-elk IIFE bundle. Defines `var ELK` consumed by drawio-mermaid and mxElkLayout. Inlined before mermaid.
- * @param {string} [options.mxElkLayoutJs] - The mxElkLayout wrapper. Requires ELK on globalThis (load order: elk → mermaid → mxElkLayout).
+ * @param {string} [options.elkJs] - The drawio-elk IIFE bundle. Defines `var ELK` (engine) plus `ElkLayout`/`ElkAdapter`/`ElkApplier` (the mxGraph bridge + postLayout facade), consumed by drawio-mermaid and the postLayout pass. Inlined before mermaid.
  * @param {string} [options.buildId] - Build identifier (git SHA + timestamp). Exposed as window.__DRAWIO_BUILD in the iframe.
  * @returns {string} Self-contained HTML string.
  */
@@ -27,7 +26,6 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
 {
   var viewerJs = (options && options.viewerJs) || null;
   var elkJs = (options && options.elkJs) || null;
-  var mxElkLayoutJs = (options && options.mxElkLayoutJs) || null;
   var buildId = (options && options.buildId) || "unknown";
   return `<!DOCTYPE html>
 <html lang="en">
@@ -376,7 +374,7 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
     <script>${pakoDeflateJs}</script>
 
     ${elkJs
-      ? '<!-- drawio-elk (inlined). Defines var ELK consumed by drawio-mermaid and mxElkLayout. Must come before drawio-mermaid. -->\n    <script>' + elkJs + '<\/script>'
+      ? '<!-- drawio-elk (inlined). Defines var ELK + ElkLayout/ElkAdapter/ElkApplier (engine + mxGraph bridge), consumed by drawio-mermaid and the postLayout pass. Must come before drawio-mermaid. -->\n    <script>' + elkJs + '<\/script>'
       : ''
     }
 
@@ -394,11 +392,6 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
       }
     </script>
     <script>${mermaidJs}</script>
-
-    ${mxElkLayoutJs
-      ? '<!-- mxElkLayout wrapper: buildElkGraph, applyElkLayout, executeAsync. Depends on mxGraph (viewer) + ELK (from drawio-elk above). -->\n    <script>' + mxElkLayoutJs + '<\/script>'
-      : ''
-    }
 
     <!-- MCP Apps SDK (inlined, exports stripped, App alias added) -->
     <script>
@@ -1213,9 +1206,14 @@ function convertMermaidToXml(mermaidText)
     return Promise.reject(new Error("drawio-mermaid bundle not loaded"));
   }
 
-  var config = {
-    theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'default'
-  };
+  // Always render with the 'default' theme: its palette is expressed in
+  // light-dark() adaptive colors, so a single render is correct in BOTH light
+  // and dark hosts (the viewer/editor color-scheme selects the variant). The
+  // named 'dark' theme is mermaid's STATIC dark palette — forcing it on a dark
+  // host bakes in fixed dark colors that then render wrong if the same diagram
+  // is later opened or exported in light mode. light-dark() is the dark-mode
+  // support; don't override it based on the host's current color-scheme.
+  var config = { theme: 'default' };
 
   try
   {
@@ -1250,18 +1248,61 @@ function generateDrawioEditUrl(xml)
   return "https://app.diagrams.net/?pv=0&grid=0#create=" + encodeURIComponent(JSON.stringify(createObj));
 }
 
-// The init directive that switches Mermaid's flowchart renderer to ELK.
-// Prepended to the round-tripped source whenever the viewer is showing a
-// layered ELK layout, so drawio-dev's isMermaidElkFlowchart() trigger fires
-// and re-renders through its ElkLayout post-pass instead of the dagre default.
-var ELK_RENDERER_DIRECTIVE = '%%{init: {"flowchart": {"defaultRenderer": "elk"}} }%%';
-
-// Prepend the ELK renderer directive unless the source already declares a
-// renderer (respect an explicit choice; never inject a second init block).
+// Injects the ELK layout selector into the round-tripped Mermaid source so a
+// re-edit in draw.io reproduces the layered ELK layout (drawio-dev's
+// isMermaidElkFlowchart() trigger fires and re-renders through its ElkLayout
+// post-pass instead of the dagre default).
+//
+// Since Mermaid v10.5.0 the %%{init}%% directive form is deprecated in favor of
+// the YAML-frontmatter config block, so we emit a "config: { layout: elk }".
+// drawio-mermaid maps config.layout === 'elk' to the same path the old
+// flowchart.defaultRenderer:elk directive triggered, and drawio-dev still
+// recognizes BOTH on re-edit (back-compat with already-saved diagrams).
+//
+// Placement rules: the config key must live INSIDE the frontmatter (Mermaid
+// only honors frontmatter at the very start of the document). So:
+//  - no frontmatter         -> emit a minimal "--- config: layout: elk ---" block
+//  - frontmatter, no config -> append a config block before the closing ---
+//  - frontmatter + config   -> nest "layout: elk" as the first child of config
+// An explicit renderer/layout already present (old directive, or any layout key
+// in the frontmatter) is respected and left untouched.
 function withElkRenderer(text)
 {
-  if (text == null || /defaultRenderer/i.test(text)) return text;
-  return ELK_RENDERER_DIRECTIVE + '\\n' + text;
+  if (text == null) return text;
+  // Old %%{init ... defaultRenderer: "elk"}%% directive is still honored on
+  // re-edit; if present, leave the source untouched.
+  if (/defaultRenderer/i.test(text)) return text;
+
+  var fm = /^(---[ \\t]*\\r?\\n)([\\s\\S]*?)(---[ \\t]*\\r?\\n)/.exec(text);
+
+  // No frontmatter: emit a minimal block carrying just the ELK layout config.
+  if (fm == null)
+  {
+    return '---\\nconfig:\\n  layout: elk\\n---\\n' + text;
+  }
+
+  var open = fm[1], body = fm[2], close = fm[3];
+  var rest = text.substring(fm[0].length);
+
+  // Respect an explicit layout already declared in the frontmatter.
+  if (/(?:^|\\n)[ \\t]*layout[ \\t]*:/.test(body)) return text;
+
+  // Existing config: block -> nest "layout: elk" as its first child, matching
+  // the indentation of the block's existing children (falls back to one level
+  // deeper than config: when the block is empty).
+  var cfg = /(?:^|\\n)([ \\t]*)config[ \\t]*:[ \\t]*\\r?\\n/.exec(body);
+
+  if (cfg != null)
+  {
+    var at = cfg.index + cfg[0].length;
+    var child = /^([ \\t]+)\\S/.exec(body.substring(at));
+    var indent = child ? child[1] : (cfg[1] + '  ');
+    body = body.substring(0, at) + indent + 'layout: elk\\n' + body.substring(at);
+    return open + body + close + rest;
+  }
+
+  // Frontmatter present but no config: block -> append one before the closer.
+  return open + body + 'config:\\n  layout: elk\\n' + close + rest;
 }
 
 /**
@@ -1275,7 +1316,7 @@ function withElkRenderer(text)
  * When the viewer is currently showing a layered ELK layout (currentLayoutState
  * is 'vertical' / 'horizontal' — set by an explicit verticalFlow/horizontalFlow
  * postLayout or the layout-toggle button), the stored Mermaid source gets the
- * ELK renderer directive (%%{init: {"flowchart": {"defaultRenderer": "elk"}}}%%)
+ * ELK layout config (frontmatter "config: { layout: elk }", via withElkRenderer)
  * so a re-edit in draw.io re-runs through ELK — drawio-dev already applies its
  * ElkLayout post-pass to elk-flowchart sources. Start/end pins are deliberately
  * NOT carried in the config: Mermaid's ELK renderer accepts no such hints, and
@@ -1328,152 +1369,24 @@ function serializeGraphXml(graph)
 }
 
 /**
- * Configure an mxElkLayout instance for the requested algorithm.
- * Returns null if the algorithm is unknown or the ELK bundle failed
- * to load. All options map to ELK's layered/mrtree/force/stress/radial
- * algorithms — direction only applies to 'layered'.
- */
-function createPostLayout(graph, algorithm)
-{
-  if (algorithm == null || algorithm === 'none') return null;
-  if (typeof mxElkLayout === 'undefined' || typeof ELK === 'undefined') return null;
-
-  // Algorithm presets mirror drawio-dev's ElkLayout.DEFAULTS so the
-  // viewer's layout output matches the editor's Arrange > Layout
-  // menu (Layered / Tree / Force / Stress / Radial).
-  // Ref: drawio-dev/src/main/webapp/js/diagramly/ElkLayout.js
-  var options = null;
-
-  switch (algorithm)
-  {
-    case 'verticalFlow':
-    case 'horizontalFlow':
-      options = {
-        'elk.algorithm': 'layered',
-        'elk.direction': algorithm === 'verticalFlow' ? 'DOWN' : 'RIGHT',
-        'elk.edgeRouting': 'ORTHOGONAL',
-        'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
-        'elk.spacing.nodeNode': '30',
-        'elk.layered.spacing.nodeNodeBetweenLayers': '30',
-        // Reserve space in the layer gap for edge labels so long labels
-        // don't overlap nodes on the next layer.
-        'elk.edgeLabels.inline': 'true',
-        'elk.spacing.edgeLabel': '5',
-        // Keep within-layer Y ordering aligned with child-declaration
-        // order in the model (what mermaid imports and hand-written
-        // XML both rely on).
-        'elk.layered.considerModelOrder.strategy': 'NODES',
-        'elk.layered.crossingMinimization.forceNodeModelOrder': 'true'
-      };
-      break;
-    case 'tree':
-      options = {
-        'elk.algorithm': 'mrtree',
-        'elk.direction': 'DOWN',
-        'elk.spacing.nodeNode': '20',
-        'elk.mrtree.weighting': 'MODEL_ORDER'
-      };
-      break;
-    case 'force':
-      options = {
-        'elk.algorithm': 'force',
-        // ELK's F-R model computes k = sqrt(area/(2n)) * nodeNode * 0.01,
-        // so nodeNode is a multiplier on natural edge length, not pixels.
-        // 10 matches the legacy mxFastOrganicLayout's fixed k≈50 — keeps
-        // the graph tight rather than blown out across the canvas.
-        'elk.spacing.nodeNode': '10',
-        'elk.force.iterations': '300',
-        'elk.force.repulsivePower': '0'
-      };
-      break;
-    case 'stress':
-      options = {
-        'elk.algorithm': 'stress',
-        'elk.spacing.nodeNode': '80',
-        'elk.stress.desiredEdgeLength': '100'
-      };
-      break;
-    case 'radial':
-      options = {
-        'elk.algorithm': 'radial',
-        'elk.spacing.nodeNode': '20'
-      };
-      break;
-    default:
-      return null;
-  }
-
-  var layout = new mxElkLayout(graph, options);
-  layout.algorithm = options['elk.algorithm'];
-  if (options['elk.direction'] != null) layout.direction = options['elk.direction'];
-  return layout;
-}
-
-/**
  * Apply a post-render layout to the given graph and animate the
  * vertices morphing from their original positions to the new ones.
  *
- * ELK runs async. We snapshot the current model into an ELK graph
- * synchronously, then when ELK returns we wrap applyElkLayout in a
- * beginUpdate block deferred by mxMorphing — mirroring the drawio
- * EditorUi.executeLayout pattern so the view stays on pre-layout
- * positions during the morph.
+ * ELK runs async via the drawio-elk ElkLayout facade: prepare() snapshots
+ * the model, runs ELK off the render path, and hands back a synchronous
+ * apply() closure (DEFAULTS merge + mermaid policy + isolated-node
+ * handling + edge style/corners + applier). We bracket apply() in a
+ * beginUpdate block deferred by mxMorphing — mirroring drawio's
+ * EditorUi.executeLayout so the view stays on pre-layout positions during
+ * the morph. The algorithm name + canonical edge treatment come from
+ * ElkLayout.MENU_PRESETS / ElkLayout.CANONICAL_EDGE in the bundle, the
+ * single source shared with the editor's menu and mermaid-edit post-pass.
  *
  * @param {Graph} graph
  * @param {string} algorithm - Enum value from the postLayout schema.
  * @param {function(boolean)} [onDone] - Called with true when the
  *   layout was applied, false when it was skipped or ELK errored.
  */
-/**
- * Force every edge in the graph to render as orthogonal-with-rounded-
- * corners: rounded=1 ON, curved=0 OFF. Called after layered ELK
- * layouts so that ORTHOGONAL bend points actually look like clean
- * right-angle routes (mermaid sets curved=1 by default, which would
- * spline through the bend points and produce wiggly edges).
- */
-function normalizeEdgesToRounded(graph)
-{
-  if (graph == null) return;
-  var model = graph.getModel();
-  var changed = 0;
-
-  for (var id in model.cells)
-  {
-    var cell = model.cells[id];
-    if (cell == null || !cell.edge) continue;
-
-    var style = cell.style || '';
-    var parts = style.split(';');
-    var seenRounded = false;
-    var out = [];
-
-    for (var i = 0; i < parts.length; i++)
-    {
-      var p = parts[i].trim();
-      if (p === '') continue;
-      if (p.indexOf('curved=') === 0) continue; // strip curved
-      if (p.indexOf('rounded=') === 0)
-      {
-        out.push('rounded=1');
-        seenRounded = true;
-      }
-      else
-      {
-        out.push(p);
-      }
-    }
-
-    if (!seenRounded) out.push('rounded=1');
-
-    var newStyle = out.join(';');
-    if (newStyle !== style)
-    {
-      model.setStyle(cell, newStyle);
-      changed++;
-    }
-  }
-
-}
 
 function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorph, fadeEdges)
 {
@@ -1484,44 +1397,44 @@ function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorp
 
   if (graph == null) { done(false); return; }
 
-  var layout = createPostLayout(graph, algorithm);
-  if (layout == null) { done(false); return; }
+  if (typeof ElkLayout === 'undefined' || typeof ELK === 'undefined')
+  {
+    done(false);
+    return;
+  }
+
+  // Resolve the menu name (verticalFlow / horizontalFlow / …) to an ELK
+  // algorithm + the direction it pins. The per-algorithm option baseline,
+  // mermaid hierarchy policy, isolated-node handling, edge style and
+  // corners all live in the drawio-elk ElkLayout facade now — this used to
+  // be hand-rolled here via the mxElkLayout shim, which is gone.
+  var preset = (ElkLayout.MENU_PRESETS || {})[algorithm];
+  if (preset == null) { done(false); return; }
 
   var model = graph.getModel();
   var parent = graph.getDefaultParent();
 
-  var elkGraph;
-  try
+  // Nothing to lay out → bail (matches the old empty-elkGraph guard).
+  var hasVertex = false;
+  var childCount = model.getChildCount(parent);
+  for (var ci = 0; ci < childCount; ci++)
   {
-    elkGraph = layout.buildElkGraph(parent);
+    if (model.isVertex(model.getChildAt(parent, ci))) { hasVertex = true; break; }
   }
-  catch (e)
+  if (!hasVertex) { done(false); return; }
+
+  // Canonical edge treatment (orthogonal + rounded), shared with the
+  // editor's mermaid-edit post-pass and Arrange > Layout dialog default.
+  // resizeParent:false keeps the mermaid-sized group container intact.
+  var elkOptions = { mermaidPolicy: true, applierOptions: { resizeParent: false } };
+  if (ElkLayout.CANONICAL_EDGE != null)
   {
-    done(false);
-    return;
+    elkOptions.edgeStyleMode = ElkLayout.CANONICAL_EDGE.edgeStyleMode;
+    elkOptions.corners = ElkLayout.CANONICAL_EDGE.corners;
   }
 
-  if (!elkGraph.children || elkGraph.children.length === 0)
-  {
-    done(false);
-    return;
-  }
-
-  // For layered: top-level cells with no edges and no children (e.g.
-  // mermaid's frontmatter title, inserted as a standalone text vertex)
-  // would otherwise get assigned to the first layer alongside the flow
-  // start — fine on verticalFlow (top row) but crushes horizontalFlow
-  // (leftmost column). The drawio-elk bridge exposes a pre/post hook
-  // for this: extractIsolatedTopLevel strips them from the ELK input;
-  // placeIsolatedTopLevelAbove re-places them above the laid-out bbox
-  // after applyElkLayout.
-  var isolatedNodes = [];
-  if (layout.algorithm === 'layered'
-      && typeof ElkLayout !== 'undefined'
-      && typeof ElkLayout.extractIsolatedTopLevel === 'function')
-  {
-    isolatedNodes = ElkLayout.extractIsolatedTopLevel(elkGraph) || [];
-  }
+  var layout = new ElkLayout(graph, preset.algorithm,
+    Object.assign({}, preset.options), elkOptions);
 
   // ELK gates layout application; awaitBeforeMorph gates mxMorphing
   // separately. ELK is the variable cost (100–500 ms for big diagrams).
@@ -1529,34 +1442,22 @@ function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorp
   // fires as soon as ELK has applied — no need to wait for pop-in
   // animations to settle. mxMorphing still waits, because it snapshots
   // cell opacity and would otherwise capture a half-faded view.
-  new ELK().layout(elkGraph).then(function(result)
+  // prepare() runs ELK async and returns a synchronous apply() closure
+  // (DEFAULTS merge, mermaid policy, isolated-node extract/replace, edge
+  // style + corners, applier). We bracket apply() with beginUpdate so the
+  // mxMorphing animation below picks up the pre/post diff — the same shape
+  // the editor's ElkLayout.run + executeLayout uses.
+  layout.prepare(parent, function(err, apply)
   {
+    if (err != null) { done(false); return; }
+
     model.beginUpdate();
 
     var committed = false;
 
     try
     {
-      layout.applyElkLayout(result);
-      // For layered (verticalFlow / horizontalFlow) we asked ELK for
-      // ORTHOGONAL routing — the geometry is right-angle paths with
-      // bend points. Mermaid emits edges with curved=1 by default,
-      // which makes mxGraph spline through those bend points and
-      // produces wiggly curves. Force rounded=1 / curved=0 so the
-      // edges render as right-angles with rounded corners — the
-      // intent of the orthogonal routing.
-      if (layout.algorithm === 'layered')
-      {
-        normalizeEdgesToRounded(graph);
-      }
-      if (isolatedNodes.length > 0
-          && typeof ElkLayout !== 'undefined'
-          && typeof ElkLayout.placeIsolatedTopLevelAbove === 'function'
-          && layout._elkToCellMap != null)
-      {
-        ElkLayout.placeIsolatedTopLevelAbove(
-          graph, model, layout._elkToCellMap, isolatedNodes, elkGraph.children);
-      }
+      apply();
       committed = true;
     }
     catch (e)
@@ -1646,9 +1547,6 @@ function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorp
         done(true);
       }
     });
-  }).catch(function(e)
-  {
-    done(false);
   });
 }
 
@@ -4874,8 +4772,9 @@ function computeTopAnchoredTransform(targetScale)
 // them when the user toggles back to "none". Without this we'd lose
 // the original layout permanently after the first ELK pass.
 var originalCellGeometries = null;
-// Edge styles are mutated by normalizeEdgesToRounded in the layered
-// ELK path (curved=1 → rounded=1, no curve). Restoring geometries
+// Edge styles are mutated by the layered ELK pass (the ElkLayout facade
+// rewrites curved=1 → rounded=1 and upgrades to orthogonalEdgeStyle).
+// Restoring geometries
 // alone leaves edges drawn as right-angles when toggling back to "as
 // authored", so we capture styles too.
 var originalCellStyles = null;
@@ -4917,8 +4816,8 @@ function restoreOriginalGeometriesToModel(model)
     var cell = model.getCell(id);
     if (cell == null) continue;
     model.setGeometry(cell, originalCellGeometries[id].clone());
-    // Restore style if it differs (normalizeEdgesToRounded may have
-    // mutated edge styles during a layered ELK pass).
+    // Restore style if it differs (the layered ELK pass may have
+    // mutated edge styles).
     if (originalCellStyles != null)
     {
       var origStyle = originalCellStyles[id];
@@ -5189,9 +5088,9 @@ function handleMermaidPartial(partialMermaid)
   var xml;
   try
   {
-    xml = mxMermaidToDrawio.parseText(healed, {
-      theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'default'
-    });
+    // 'default' = light-dark() adaptive palette, correct in both light and
+    // dark hosts (see convertMermaidToXml for the rationale).
+    xml = mxMermaidToDrawio.parseText(healed, { theme: 'default' });
   }
   catch (e)
   {

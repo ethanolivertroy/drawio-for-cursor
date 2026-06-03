@@ -61,8 +61,8 @@ const pakoDeflateJs = fs.readFileSync(
 
 // Read + process the drawio-elk bundle (vendored from drawio-dev — see
 // vendor/elk/README.md). Ships as ESM; processElkBundle strips the export
-// and aliases the default export to `var ELK` so drawio-mermaid and
-// mxElkLayout pick it up from globalThis. MUST be loaded before mermaid.
+// and aliases the default export to `var ELK` so drawio-mermaid and the
+// postLayout pass pick it up from globalThis. MUST be loaded before mermaid.
 const elkBundlePath = path.join(__dirname, "..", "vendor", "elk", "drawio-elk.min.js");
 const elkRaw = fs.readFileSync(elkBundlePath, "utf-8");
 const elkJs = processElkBundle(elkRaw);
@@ -76,12 +76,6 @@ const mermaidBundlePath = path.join(__dirname, "..", "vendor", "mermaid", "drawi
 const mermaidRaw = fs.readFileSync(mermaidBundlePath, "utf-8");
 const mermaidJs = processMermaidBundle(mermaidRaw);
 console.log(`Mermaid bundle: ${mermaidBundlePath} (${(mermaidRaw.length / 1024).toFixed(1)} KB)`);
-
-// Read the mxElkLayout wrapper (vendored from drawio-dev origin/elk-layout —
-// see vendor/elk/README.md).
-const mxElkLayoutPath = path.join(__dirname, "..", "vendor", "elk", "mxElkLayout.js");
-const mxElkLayoutJs = fs.readFileSync(mxElkLayoutPath, "utf-8");
-console.log(`mxElkLayout: ${mxElkLayoutPath} (${(mxElkLayoutJs.length / 1024).toFixed(1)} KB)`);
 
 // Read the shared XML reference (single source of truth for all prompts)
 const xmlReference = fs.readFileSync(
@@ -120,7 +114,7 @@ console.log(`Favicon: ${faviconPath} (${(faviconBase64.length / 1024).toFixed(1)
 // worker can echo it in every tool response.
 const buildId = getBuildId();
 console.log(`Build ID: ${buildId}`);
-const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { elkJs, mxElkLayoutJs, buildId });
+const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { elkJs, buildId });
 const outPath = path.join(__dirname, "generated-html.js");
 
 fs.writeFileSync(outPath,

@@ -60,7 +60,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Inline the drawio-elk bundle (Eclipse Layout Kernel, ~790 KB). Ships as
 // ESM with a default export (the ELK class); processElkBundle strips the
 // export and aliases it to `var ELK` so it ends up on globalThis (consumed
-// by drawio-mermaid and mxElkLayout). MUST be loaded before drawio-mermaid.
+// by drawio-mermaid and the postLayout pass). MUST be loaded before drawio-mermaid.
 const elkJs = processElkBundle(fs.readFileSync(
   path.join(__dirname, "..", "vendor", "elk", "drawio-elk.min.js"), "utf-8"
 ));
@@ -72,11 +72,6 @@ const elkJs = processElkBundle(fs.readFileSync(
 const mermaidJs = processMermaidBundle(fs.readFileSync(
   path.join(__dirname, "..", "vendor", "mermaid", "drawio-mermaid.min.js"), "utf-8"
 ));
-
-// Inline the mxElkLayout wrapper (vendored from drawio-dev origin/elk-layout
-// — see vendor/elk/README.md). Powers the optional postLayout pass on
-// create_diagram.
-const mxElkLayoutJs = fs.readFileSync(path.join(__dirname, "..", "vendor", "elk", "mxElkLayout.js"), "utf-8");
 
 // Optionally inline a local viewer build (for testing GraphViewer changes).
 // Set VIEWER_PATH env var to the path of viewer-static.min.js (or a directory
@@ -135,7 +130,7 @@ if (fs.existsSync(shapeIndexPath))
 
 // Pre-build the HTML once. The buildId is baked into the HTML so the
 // iframe exposes it via window.__DRAWIO_BUILD (visible in DevTools).
-const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { viewerJs, elkJs, mxElkLayoutJs, buildId });
+const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { viewerJs, elkJs, buildId });
 
 // --- Transport setup ---
 
