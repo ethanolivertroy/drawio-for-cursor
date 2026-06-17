@@ -72,6 +72,21 @@ An alternative approach that works **without installing anything**. Add instruct
 
 ---
 
+## Diagram layouts
+
+Two optional, independent layout passes can run after the AI generates a diagram — one re-arranges the nodes, the other only reroutes the edges. Which are available depends on the approach:
+
+| Layout pass | What it does | App Server (`create_diagram`) | Tool Server (`open_drawio_xml`) | Skill + CLI | Project Instructions |
+|---|---|---|---|---|---|
+| **ELK auto-layout** (`postLayout: "elk"`) | Re-arranges nodes into a clean layered layout; routes the edges as part of it | ✅ | — | planned (via draw.io Desktop ELK) | — |
+| **libavoid routing** (`routing: "libavoid"`) | Keeps node positions; reroutes connectors orthogonally *around* the shapes | ✅ | ✅ from **v1.3.0** | — | — |
+
+- These apply to **draw.io XML** diagrams. **Mermaid** diagrams are auto-laid-out already, so neither pass is needed.
+- The **App Server** applies these in the inline viewer after the diagram renders; the **Tool Server** applies libavoid server-side before opening the draw.io editor.
+- Pick one, not both: ELK already routes its own edges, so adding libavoid on top is redundant. Use `postLayout` to re-arrange a layout, or `routing` to tidy the connectors on a layout you placed deliberately.
+
+---
+
 ## Data Residency & Offline Use
 
 If you're deploying in an environment with strict data restrictions, here is exactly
