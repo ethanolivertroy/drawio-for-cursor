@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { buildHtml, processAppBundle, processMermaidBundle, processElkBundle } from "./shared.js";
+import { buildHtml, processAppBundle, processMermaidBundle, processElkBundle, processLibavoidBundle } from "./shared.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +77,19 @@ const mermaidRaw = fs.readFileSync(mermaidBundlePath, "utf-8");
 const mermaidJs = processMermaidBundle(mermaidRaw);
 console.log(`Mermaid bundle: ${mermaidBundlePath} (${(mermaidRaw.length / 1024).toFixed(1)} KB)`);
 
+// Read + process the libavoid-js bundle (WASM obstacle-avoiding edge router —
+// see vendor/libavoid/README.md). The glue ships as ESM + import.meta.url;
+// processLibavoidBundle neutralizes that, patches the loader to read
+// globalThis.__LIBAVOID_WASM_BINARY, and aliases globalThis.AvoidLib. The wasm
+// is a separate artifact (no SINGLE_FILE build) base64-inlined and handed in as
+// wasmBinary so the router instantiates with no fetch.
+const libavoidBundlePath = path.join(__dirname, "..", "vendor", "libavoid", "libavoid.min.js");
+const libavoidRaw = fs.readFileSync(libavoidBundlePath, "utf-8");
+const libavoidJs = processLibavoidBundle(libavoidRaw);
+const libavoidWasmPath = path.join(__dirname, "..", "vendor", "libavoid", "libavoid.wasm");
+const libavoidWasmB64 = fs.readFileSync(libavoidWasmPath).toString("base64");
+console.log(`libavoid bundle: ${libavoidBundlePath} (${(libavoidRaw.length / 1024).toFixed(1)} KB glue, ${(libavoidWasmB64.length / 1024).toFixed(1)} KB wasm base64)`);
+
 // Read the shared XML reference (single source of truth for all prompts)
 const xmlReference = fs.readFileSync(
   path.join(__dirname, "..", "..", "shared", "xml-reference.md"),
@@ -114,7 +127,7 @@ console.log(`Favicon: ${faviconPath} (${(faviconBase64.length / 1024).toFixed(1)
 // worker can echo it in every tool response.
 const buildId = getBuildId();
 console.log(`Build ID: ${buildId}`);
-const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { elkJs, buildId });
+const html = buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, { elkJs, libavoidJs, libavoidWasmB64, buildId });
 const outPath = path.join(__dirname, "generated-html.js");
 
 fs.writeFileSync(outPath,

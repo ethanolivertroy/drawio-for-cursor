@@ -19,6 +19,8 @@ import { normalizeDiagramXml, INVALID_DIAGRAM_XML_MESSAGE } from "./normalize-di
  * @param {object} [options] - Optional configuration.
  * @param {string} [options.viewerJs] - If provided, inlines this JS instead of loading viewer-static.min.js from CDN.
  * @param {string} [options.elkJs] - The drawio-elk IIFE bundle. Defines `var ELK` (engine) plus `ElkLayout`/`ElkAdapter`/`ElkApplier` (the mxGraph bridge + postLayout facade), consumed by drawio-mermaid and the postLayout pass. Inlined before mermaid.
+ * @param {string} [options.libavoidJs] - The processed libavoid-js bundle (exports stripped, `globalThis.AvoidLib` aliased, loader patched to read `globalThis.__LIBAVOID_WASM_BINARY`). Powers the `routing: "libavoid"` edge-routing pass.
+ * @param {string} [options.libavoidWasmB64] - The libavoid.wasm binary, base64-encoded. Decoded to a Uint8Array and handed to the Emscripten module as `wasmBinary` so the router instantiates with no fetch.
  * @param {string} [options.buildId] - Build identifier (git SHA + timestamp). Exposed as window.__DRAWIO_BUILD in the iframe.
  * @returns {string} Self-contained HTML string.
  */
@@ -26,7 +28,52 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
 {
   var viewerJs = (options && options.viewerJs) || null;
   var elkJs = (options && options.elkJs) || null;
+  var libavoidJs = (options && options.libavoidJs) || null;
+  var libavoidWasmB64 = (options && options.libavoidWasmB64) || null;
   var buildId = (options && options.buildId) || "unknown";
+
+  // libavoid-js (WASM orthogonal edge router). The glue defines
+  // globalThis.AvoidLib; the loader below decodes the base64 wasm to a
+  // Uint8Array, hands it to the Emscripten module as wasmBinary (no fetch —
+  // see processLibavoidBundle), and kicks off async instantiation. The
+  // resulting promise is parked on window.__libavoidReady (resolving to the
+  // Avoid namespace) so the routing pass can await it on demand; load runs
+  // eagerly at page init so the wasm is usually warm by the time a
+  // routing:"libavoid" diagram finishes rendering. Failures degrade
+  // gracefully — applyRouting just skips and the diagram renders unrouted.
+  var libavoidLoader =
+    'function __libavoidB64ToBytes(b64)\n' +
+    '{\n' +
+    '  var bin = atob(b64);\n' +
+    '  var bytes = new Uint8Array(bin.length);\n' +
+    '  for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }\n' +
+    '  return bytes;\n' +
+    '}\n' +
+    '(function()\n' +
+    '{\n' +
+    '  if (typeof AvoidLib === "undefined") { console.error("[libavoid] AvoidLib global missing"); return; }\n' +
+    '  try { globalThis.__LIBAVOID_WASM_BINARY = __libavoidB64ToBytes(window.__LIBAVOID_WASM_B64); }\n' +
+    '  catch (e) { console.error("[libavoid] base64 decode failed:", e); return; }\n' +
+    '  window.__libavoidReady = AvoidLib.load().then(function()\n' +
+    '  {\n' +
+    '    window.Avoid = AvoidLib.getInstance();\n' +
+    '    return window.Avoid;\n' +
+    '  }).catch(function(e)\n' +
+    '  {\n' +
+    '    console.error("[libavoid] wasm load failed; routing disabled:", (e && e.message), e);\n' +
+    '    return null;\n' +
+    '  });\n' +
+    '})();\n';
+
+  var libavoidBlock = (libavoidJs && libavoidWasmB64)
+    ? '<!-- libavoid-js (inlined WASM edge router). Defines globalThis.AvoidLib; the loader feeds the base64 wasm in as wasmBinary (no fetch). Powers the routing:"libavoid" pass. -->\n' +
+      '    <script>' + libavoidJs + '</script>\n' +
+      '    <script>\n' +
+      '      window.__LIBAVOID_WASM_B64 = "' + libavoidWasmB64 + '";\n' +
+      '      ' + libavoidLoader +
+      '    </script>'
+    : '';
+
   return `<!DOCTYPE html>
 <html lang="en">
   <head>
@@ -377,6 +424,8 @@ export function buildHtml(appWithDepsJs, pakoDeflateJs, mermaidJs, options)
       ? '<!-- drawio-elk (inlined). Defines var ELK + ElkLayout/ElkAdapter/ElkApplier (engine + mxGraph bridge), consumed by drawio-mermaid and the postLayout pass. Must come before drawio-mermaid. -->\n    <script>' + elkJs + '<\/script>'
       : ''
     }
+
+    ${libavoidBlock}
 
     <!-- drawio-mermaid (inlined). Exposes mxMermaidToDrawio.parseText(text, config).
          Loaded after the viewer so mermaidShapes.js can see mxCellRenderer/mxActor,
@@ -1614,6 +1663,232 @@ function applyPostLayout(graph, algorithm, onDone, onMorphStart, awaitBeforeMorp
         done(true);
       }
     });
+  });
+}
+
+/**
+ * Absolute model-coordinate offset of a cell's parent chain. Edge waypoints
+ * and vertex geometries are stored relative to their parent; for flat diagrams
+ * (parent = the default layer) this is {0,0}, but a cell nested in a container
+ * needs its ancestors' positions summed. Stops at the layer (non-vertex).
+ */
+function getAbsoluteParentOffset(graph, cell)
+{
+  var model = graph.getModel();
+  var x = 0, y = 0;
+  var p = model.getParent(cell);
+  while (p != null && model.isVertex(p))
+  {
+    var pg = model.getGeometry(p);
+    if (pg != null) { x += pg.x; y += pg.y; }
+    p = model.getParent(p);
+  }
+  return { x: x, y: y };
+}
+
+/**
+ * A vertex's bounds in absolute model coordinates (geometry + parent offset).
+ */
+function getAbsoluteModelBounds(graph, cell)
+{
+  var geo = graph.getModel().getGeometry(cell);
+  if (geo == null) return null;
+  var off = getAbsoluteParentOffset(graph, cell);
+  return { x: geo.x + off.x, y: geo.y + off.y, w: geo.width, h: geo.height };
+}
+
+// Three points collinear? Zero cross product (with a 1px tolerance) means the
+// middle point lies on the segment between its neighbours and is redundant.
+function isCollinear(a, b, c)
+{
+  return Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) < 1;
+}
+
+/**
+ * Run libavoid over the current graph: register every vertex as an obstacle,
+ * route every edge (whose endpoints are known vertices) around them with
+ * orthogonal obstacle-avoiding paths, and write the resulting bend points
+ * back as edge waypoints. Vertices are NOT moved — this is pure edge routing,
+ * the complement to applyPostLayout (which moves vertices). Synchronous once
+ * Avoid is ready; the caller awaits readiness via applyRouting().
+ */
+function routeWithLibavoid(graph, Avoid)
+{
+  var model = graph.getModel();
+  var router = new Avoid.Router(Avoid.RouterFlag.OrthogonalRouting.value);
+
+  // A buffer keeps wires clear of shape edges (without it routes run flush
+  // along the box borders); nudging spreads parallel routes that share a
+  // corridor so they don't overlap. NOTE: setRoutingParameter takes the
+  // RoutingParameter enum OBJECT, not its .value — passing the integer
+  // silently no-ops. (The Router constructor is the opposite: it needs
+  // RouterFlag.OrthogonalRouting.value, the integer.)
+  try { router.setRoutingParameter(Avoid.RoutingParameter.shapeBufferDistance, 16); } catch (_) {}
+  try { router.setRoutingParameter(Avoid.RoutingParameter.idealNudgingDistance, 14); } catch (_) {}
+
+  // 1. Obstacles: one ShapeRef per vertex, in absolute model coords.
+  var id;
+  for (id in model.cells)
+  {
+    var v = model.cells[id];
+    if (v == null || !v.vertex) continue;
+    var b = getAbsoluteModelBounds(graph, v);
+    if (b == null || !(b.w > 0) || !(b.h > 0)) continue;
+    new Avoid.ShapeRef(router, new Avoid.Rectangle(
+      new Avoid.Point(b.x, b.y), new Avoid.Point(b.x + b.w, b.y + b.h)));
+  }
+
+  // 2. Connectors: one ConnRef per edge with both terminals resolved to
+  //    vertices. Endpoints are fixed points at the terminal shape centers —
+  //    libavoid happily lets a connector exit its own endpoint shape. The
+  //    side where the route actually leaves/enters each shape becomes the
+  //    edge's exit/entry constraint in step 3 (we keep the shape bounds for
+  //    that), and the interior bends become waypoints.
+  var conns = [];
+  for (id in model.cells)
+  {
+    var e = model.cells[id];
+    if (e == null || !e.edge) continue;
+    var s = model.getTerminal(e, true);
+    var t = model.getTerminal(e, false);
+    if (s == null || t == null || !s.vertex || !t.vertex) continue;
+    var sb = getAbsoluteModelBounds(graph, s);
+    var tb = getAbsoluteModelBounds(graph, t);
+    if (sb == null || tb == null) continue;
+    var conn = new Avoid.ConnRef(router,
+      new Avoid.ConnEnd(new Avoid.Point(sb.x + sb.w / 2, sb.y + sb.h / 2)),
+      new Avoid.ConnEnd(new Avoid.Point(tb.x + tb.w / 2, tb.y + tb.h / 2)));
+    conns.push({ edge: e, conn: conn });
+  }
+
+  if (conns.length === 0) { router.delete(); return false; }
+
+  router.processTransaction();
+
+  // 3. Map each orthogonal route onto an orthogonalEdgeStyle edge. We keep
+  //    that style (rather than baking in straight segments) so the segments
+  //    stay draggable in the draw.io editor — libavoid's route is already
+  //    axis-aligned, so it maps cleanly. We anchor connectors at shape
+  //    centers, so every route leaves/enters at a side MIDPOINT — which is
+  //    exactly where orthogonalEdgeStyle connects a floating endpoint by
+  //    default. So we set NO exitX/Y / entryX/Y constraints: the floating
+  //    connection lands in the same place AND re-routes naturally if the user
+  //    later moves a shape in the editor. We only write the interior bends as
+  //    waypoints (collinear/redundant points dropped); the first/last route
+  //    points are the centers, which the floating endpoints supersede.
+  model.beginUpdate();
+  try
+  {
+    for (var i = 0; i < conns.length; i++)
+    {
+      var edge = conns[i].edge;
+      var route = conns[i].conn.displayRoute();
+      var n = route.size();
+      if (n < 2) continue;
+
+      var off = getAbsoluteParentOffset(graph, edge);
+
+      var pts = [];
+      for (var k = 0; k < n; k++)
+      {
+        var rp = route.at(k);
+        pts.push({ x: rp.x, y: rp.y });
+      }
+
+      // Interior bends only; drop any point collinear with its neighbours
+      // (libavoid is usually minimal already, but this is cheap insurance).
+      var wps = [];
+      for (var j = 1; j < n - 1; j++)
+      {
+        if (isCollinear(pts[j - 1], pts[j], pts[j + 1])) continue;
+        wps.push(new mxPoint(Math.round(pts[j].x) - off.x, Math.round(pts[j].y) - off.y));
+      }
+
+      var geo = model.getGeometry(edge);
+      geo = (geo != null) ? geo.clone() : new mxGeometry();
+      geo.points = wps;
+      model.setGeometry(edge, geo);
+
+      // Keep orthogonalEdgeStyle (libavoid is orthogonal); curved=0 so the
+      // right angles aren't bowed. Any author rounded=1 still softens corners.
+      var style = model.getStyle(edge) || '';
+      style = mxUtils.setStyle(style, mxConstants.STYLE_EDGE, 'orthogonalEdgeStyle');
+      style = mxUtils.setStyle(style, 'curved', '0');
+      model.setStyle(edge, style);
+    }
+  }
+  finally
+  {
+    model.endUpdate();
+    router.delete();
+  }
+
+  graph.view.validate();
+  console.log('[libavoid] routed ' + conns.length + ' edge(s)');
+  return true;
+}
+
+/**
+ * Async wrapper around routeWithLibavoid: await wasm readiness, then route.
+ * Degrades gracefully — calls onDone(false) (diagram stays unrouted) when
+ * libavoid isn't present, failed to load, or routing throws.
+ *
+ * @param {Graph} graph
+ * @param {function(boolean)} [onDone] - true when routes were applied.
+ */
+function applyRouting(graph, onDone)
+{
+  var done = function(applied)
+  {
+    if (typeof onDone === 'function') onDone(applied);
+  };
+
+  if (graph == null || typeof window === 'undefined' || window.__libavoidReady == null)
+  {
+    done(false);
+    return;
+  }
+
+  window.__libavoidReady.then(function(Avoid)
+  {
+    if (Avoid == null) { done(false); return; }
+    try { done(routeWithLibavoid(graph, Avoid)); }
+    catch (e) { console.error('[libavoid] routing failed:', (e && e.message), e); done(false); }
+  }).catch(function() { done(false); });
+}
+
+/**
+ * Run the libavoid routing pass and, when it applies, re-reveal the edges
+ * with a fade (the re-route changes every edge's waypoints) and persist the
+ * routed XML. routeWithLibavoid renders the new edges synchronously inside
+ * the same microtask, so hiding them here happens before the next paint —
+ * no flash of the un-faded routes. Vertices never move, so there is no
+ * camera change. onComplete(applied) fires after the pass either way.
+ */
+function runRoutingPass(graph, onComplete)
+{
+  applyRouting(graph, function(applied)
+  {
+    if (applied)
+    {
+      hideAllEdgesForMorph(graph);
+      requestAnimationFrame(function()
+      {
+        fadeInAllEdgesAfterMorph(graph);
+      });
+
+      try
+      {
+        var nx = serializeGraphXml(graph);
+        if (nx != null) commitDiagramXml(nx);
+      }
+      catch (_) {}
+
+      try { graph.sizeDidChange(); } catch (_) {}
+      notifySize('routing');
+    }
+
+    if (typeof onComplete === 'function') onComplete(applied);
   });
 }
 
@@ -3884,7 +4159,7 @@ function finalizeStreamingView(xml, opts)
 {
   opts = opts || {};
 
-  var key = (xml || '') + '|' + (opts.postLayout || '') + '|' + (opts.replaceMode ? 'r' : '');
+  var key = (xml || '') + '|' + (opts.postLayout || '') + '|' + (opts.routing || '') + '|' + (opts.replaceMode ? 'r' : '');
   if (key === lastFinalizedKey)
   {
     return;
@@ -4037,6 +4312,14 @@ function finalizeStreamingView(xml, opts)
         }
         catch (_) {}
 
+        // Combined ELK + libavoid: ELK has placed the vertices, now route
+        // the edges around them on the final positions. Runs after the
+        // morph so it sees where things actually landed.
+        if (opts.routing)
+        {
+          runRoutingPass(streamGraph);
+        }
+
         // Second-stage fit: cells have just morphed into place and
         // sizeDidChange has run, so the SVG/container bounds are now
         // final. The ELK-done fit was based on the pre-morph view
@@ -4073,6 +4356,15 @@ function finalizeStreamingView(xml, opts)
       }, awaitAnims);
     }
     catch (e) {}
+  }
+  else if (opts.routing)
+  {
+    // Routing without ELK: the author's (LLM's) vertex positions are kept;
+    // libavoid only computes obstacle-avoiding paths for the edges. The
+    // normal fit above already ran (no postLayout), and routing doesn't move
+    // vertices, so no extra camera move is needed. applyRouting awaits wasm
+    // readiness internally, so no rAF gate here.
+    runRoutingPass(streamGraph);
   }
 
   notifySize('finalize');
@@ -5558,12 +5850,13 @@ app.ontoolresult = function(result)
 
   if (textBlock && textBlock.type === "text")
   {
-    // Unified payload: {xml|mermaid, postLayout, direction (XML only), _buildId} as JSON.
+    // Unified payload: {xml|mermaid, postLayout, direction + routing (XML only), _buildId} as JSON.
     // Fall back to treating the raw text as XML if JSON parsing fails.
     var mermaidText = null;
     var xmlText = null;
     var postLayout = null;
     var direction = null;
+    var routing = null;
 
     try
     {
@@ -5579,6 +5872,7 @@ app.ontoolresult = function(result)
         xmlText = parsed.xml;
         postLayout = parsed.postLayout || null;
         direction = parsed.direction || null;
+        routing = parsed.routing || null;
       }
     }
     catch (e)
@@ -5588,8 +5882,10 @@ app.ontoolresult = function(result)
 
     // Mermaid: direction from the flowchart code; XML: from the direction field.
     postLayout = resolvePostLayout(postLayout, direction, mermaidText);
+    // routing is "libavoid" (obstacle-avoiding edge routing) or null — XML only.
+    routing = (routing === 'libavoid') ? 'libavoid' : null;
 
-    var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout };
+    var layoutOpts = { skipIntroAnim: true, fadeIn: true, postLayout: postLayout, routing: routing };
 
     if (mermaidText != null)
     {
@@ -5944,6 +6240,39 @@ export function processElkBundle(raw)
       ElkApplier: "ElkApplier"
     },
     "drawio-elk.min.js");
+}
+
+/**
+ * Process the libavoid-js browser bundle (obstacle-avoiding orthogonal edge
+ * routing — the `routing: "libavoid"` pass). Ships as ESM ending in
+ * `export{X as AvoidLib}` and uses `import.meta.url` (illegal in a classic
+ * <script>). Three transforms before the standard strip-and-alias:
+ *
+ *   1. Neutralize `import.meta.url` → "". It is only used by the Emscripten
+ *      module to locate the .wasm via fetch — which we bypass entirely.
+ *   2. Patch the loader so the Emscripten factory receives `wasmBinary`
+ *      (a Uint8Array set on globalThis). The sandboxed iframe has no
+ *      allow-same-origin and the host CSP's connect-src forbids data: URIs,
+ *      so we hand the wasm bytes in directly instead of fetching them.
+ *   3. Strip the ESM export and alias `globalThis.AvoidLib`.
+ */
+export function processLibavoidBundle(raw)
+{
+  raw = raw.replace(/import\.meta\.url/g, '""');
+
+  // `this.avoidLib=await le({locateFile:ce})` →
+  // `... await le({locateFile:ce,wasmBinary:(globalThis.__LIBAVOID_WASM_BINARY||void 0)})`
+  var patched = raw.replace(
+    /(await\s+\w+\(\{\s*locateFile\s*:\s*\w+)\s*\}\)/,
+    "$1,wasmBinary:(globalThis.__LIBAVOID_WASM_BINARY||void 0)})"
+  );
+
+  if (patched === raw)
+  {
+    throw new Error("Could not patch libavoid loader to accept wasmBinary (loader signature changed?)");
+  }
+
+  return stripEsmExportsAndAlias(patched, { AvoidLib: "AvoidLib" }, "libavoid.min.js");
 }
 
 // ── Diagram validation ───────────────────────────────────────────────────────
@@ -6534,7 +6863,7 @@ export function createServer(html, options = {})
         "- **Any diagram requiring specific colors, fonts, stencils, or layouts** that Mermaid can't control precisely\n" +
         "Call `search_shapes` first when you need industry icons (AWS / Azure / Cisco / P&ID / Kubernetes / floorplan / mockup / electrical) to find the correct `style` string for each shape.\n\n" +
         "---\n\n" +
-        "**XML reasoning discipline (applies ONLY when you chose XML — skip this whole section if you're using Mermaid):** Your job in XML is declaring logical structure — nodes, edges, labels, groupings. Follow these steps in order: (1) **Decide `postLayout` FIRST, before writing any XML.** If the XML diagram is a flowchart, state diagram, decision tree, or any directional/hierarchical process diagram (which you should rarely be writing as XML — prefer Mermaid), you MUST pass `postLayout: \"elk\"` (add `direction: \"horizontal\"` when the flow is drawn left-to-right; it defaults to vertical). Omit `postLayout` only when the layout carries hand-crafted meaning (swimlanes, containers, architecture, UML) — the typical reason you chose XML in the first place. When `postLayout` is set, your x/y coordinates only need to express rough direction; ELK re-lays out the vertices. (2) Pick ONE concrete scenario on your first impulse and commit — do not pitch alternatives, do not flip-flop between approaches. (3) Use the rigid grid in the XML reference (`x = col*180 + 40`, `y = row*120 + 40`) without computing spacings, canvas dimensions, or overlap checks. (4) Never add `<Array as=\"points\">` waypoints or `exitX/exitY/entryX/entryY` — when postLayout runs, ELK sets them; otherwise drawio's edge router handles it. (5) Do NOT narrate in your reasoning: no \"building the diagram\", no column enumeration, no coordinate math in prose, no coordinate re-verification after placement. Go straight to XML.\n\n" +
+        "**XML reasoning discipline (applies ONLY when you chose XML — skip this whole section if you're using Mermaid):** Your job in XML is declaring logical structure — nodes, edges, labels, groupings. Follow these steps in order: (1) **Decide `postLayout` and `routing` FIRST, before writing any XML.** If the XML diagram is a flowchart, state diagram, decision tree, or any directional/hierarchical process diagram (which you should rarely be writing as XML — prefer Mermaid), you MUST pass `postLayout: \"elk\"` (add `direction: \"horizontal\"` when the flow is drawn left-to-right; it defaults to vertical). Omit `postLayout` only when the layout carries hand-crafted meaning (swimlanes, containers, architecture, UML) — the typical reason you chose XML in the first place. When `postLayout` is set, your x/y coordinates only need to express rough direction; ELK re-lays out the vertices. For those hand-placed diagrams where you omit `postLayout`, consider `routing: \"libavoid\"` — it leaves your positions untouched and only routes the edges around the boxes in clean right angles (set it whenever connectors would otherwise overlap or cut through shapes). Treat `postLayout` and `routing` as alternatives: ELK already routes its own edges, so if you set `postLayout: \"elk\"` do NOT also set `routing` (redundant); use `routing` only on a hand-placed layout where you are NOT re-laying-out with ELK. (2) Pick ONE concrete scenario on your first impulse and commit — do not pitch alternatives, do not flip-flop between approaches. (3) Use the rigid grid in the XML reference (`x = col*180 + 40`, `y = row*120 + 40`) without computing spacings, canvas dimensions, or overlap checks. (4) Never add `<Array as=\"points\">` waypoints or `exitX/exitY/entryX/entryY` — when postLayout or routing runs it sets them; otherwise drawio's edge router handles it. (5) Do NOT narrate in your reasoning: no \"building the diagram\", no column enumeration, no coordinate math in prose, no coordinate re-verification after placement. Go straight to XML.\n\n" +
         "**User preference override — XML only.** If the user expresses a preference for draw.io XML over Mermaid in any phrasing (examples: \"no mermaid\", \"skip mermaid\", \"use xml\", \"I want drawio format\", \"stop using mermaid\", \"give me the xml\", \"native drawio only\", etc.), from that point onward in the conversation you MUST use the `xml` parameter exclusively and MUST NOT use the `mermaid` parameter, even for diagram types where Mermaid would normally be preferable. This preference persists for the remainder of the conversation unless the user clearly reverses it (e.g. \"mermaid is fine again\"). When the preference is active, translate any diagram request — including flowcharts, sequence diagrams, ER diagrams, etc. — directly to well-formed mxGraphModel XML.\n\n" +
         "When using XML: IMPORTANT — the XML must be well-formed. Do NOT include ANY XML comments (<!-- -->) in the output.\n\n" +
         xmlReference +
@@ -6567,6 +6896,13 @@ export function createServer(html, options = {})
           .describe(
             "**XML only** — the flow direction for `postLayout: \"elk\"` on XML diagrams: `vertical` (top-down) or `horizontal` (left-to-right). Defaults to `vertical`. **Ignored for Mermaid**, where direction is read from the flowchart code (`flowchart TD/TB` vs `LR/RL`). Only meaningful together with `postLayout: \"elk\"`."
           ),
+        routing: z
+          .enum(["libavoid"])
+          .optional()
+          .describe(
+            "**XML only** — optional obstacle-avoiding orthogonal **edge-routing** pass (libavoid). The only value is `\"libavoid\"`. Unlike `postLayout`, this does **not** move any vertices — it keeps your hand-placed coordinates and only recomputes each edge's path so wires run in clean right-angle segments that route *around* the boxes instead of cutting through them. Set it for XML diagrams where you have placed nodes deliberately (architecture, network topology, deployment, swimlanes, UML, floor plans) and want tidy connectors without overlaps — exactly the diagrams where you'd OMIT `postLayout`.\n" +
+            "draw.io's default router is basic (straight or simple right-angle lines with **no obstacle avoidance** — wires cut straight through any box between the endpoints), so reach for `\"libavoid\"` whenever edges would otherwise cross shapes or you want uniformly clean orthogonal wiring on a layout you placed yourself. Think of `routing` and `postLayout` as **alternatives**: use `routing: \"libavoid\"` to keep your positions and only fix the wires, or `postLayout: \"elk\"` to re-lay-out the vertices — and note ELK already routes its edges decently, so when you use `postLayout` you normally should **not** also set `routing` (the combination is redundant in almost all cases). Do not add `<Array as=\"points\">` waypoints yourself when routing is set; libavoid computes them. **Ignored for Mermaid** (its native/ELK layout already routes)."
+          ),
       },
       annotations:
       {
@@ -6582,7 +6918,7 @@ export function createServer(html, options = {})
         "openai/toolInvocation/invoked": "Diagram ready.",
       },
     },
-    async function({ xml, mermaid, postLayout, direction })
+    async function({ xml, mermaid, postLayout, direction, routing })
     {
       var hasXml = (xml != null && typeof xml === "string" && xml.trim().length > 0);
       var hasMermaid = (mermaid != null && typeof mermaid === "string" && mermaid.trim().length > 0);
@@ -6620,8 +6956,10 @@ export function createServer(html, options = {})
 
       var xmlPayload = { xml: normalizedXml };
       if (postLayout) xmlPayload.postLayout = postLayout;
-      // direction is XML-only; Mermaid derives it from the flowchart code.
+      // direction + routing are XML-only; Mermaid derives direction from the
+      // flowchart code and its layout already routes, so routing is omitted there.
       if (direction) xmlPayload.direction = direction;
+      if (routing) xmlPayload.routing = routing;
       xmlPayload._buildId = buildId;
 
       var content = [
