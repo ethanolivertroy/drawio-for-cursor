@@ -48,7 +48,7 @@ Read `$DRAWIO_SKILL/xml-reference.md` before authoring XML.
 | External HTTP API | External system box |
 | Shared library package only | Omit from container view (mention in notes) unless user wants packages |
 
-- Label boxes with **real names** from the repo (`mcp-tool-server`, `order-service`), not generic “Service A”.
+- Label boxes with **real names** from the repo (`order-service`, `billing-api`), not generic “Service A”.
 - Edges are **runtime** dependencies (calls, publishes, reads), not import graphs. An edge label can be `HTTP`, `gRPC`, `SQL`, `publish`.
 - Group by trust boundary when obvious (VPC, cluster, “Browser”, “Third-party”).
 

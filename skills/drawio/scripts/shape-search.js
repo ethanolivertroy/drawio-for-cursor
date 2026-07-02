@@ -4,10 +4,8 @@
 // splitting, and scored AND/OR ranking over the flat shape index produced by
 // shape-search/generate-index.js.
 //
-// Single source of truth for the `search_shapes` tool in both the MCP App
-// server (mcp-app-server) and the MCP Tool server (mcp-tool-server). The tool
-// server copies this file into src/ via its `copy-shared` build step; the app
-// server imports it directly.
+// Shape-search algorithm (Soundex + scored AND ranking) over the flat index
+// produced by shape-search/generate-index.js. Used by scripts/search-shapes.js.
 
 /**
  * Soundex phonetic encoding — matches the implementation in draw.io's Editor.js.

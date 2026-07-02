@@ -29,13 +29,9 @@ yarn-error.log*
 # Test coverage
 coverage/
 
-# Package manager locks (keep one, usually package-lock.json)
+# Package manager locks (keep package-lock.json in shape-search)
 yarn.lock
 pnpm-lock.yaml
 
 # TypeScript cache
 *.tsbuildinfo
-
-# Claude Code
-.claude/
-test/

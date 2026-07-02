@@ -7,7 +7,7 @@ description: Always use when user asks to create, generate, draw, or design a di
 
 Generate draw.io diagrams as **native `.drawio` files** on disk and open them in the **draw.io Desktop** app. This skill is fully local: never open `app.diagrams.net`, never build browser `#create=` URLs, and never call the hosted MCP endpoint (`mcp.draw.io`).
 
-Companion skills (install via `plugins/cursor/install.sh`): **`drawio-update`** (edit in place), **`drawio-from-code`** (repo → architecture), **`drawio-erd`** (schema → ERD), **`drawio-iac`** (Terraform/K8s/… → infra), **`drawio-docs`** (export into `docs/`). Hand off when the request matches those jobs instead of creating a brand-new diagram here.
+Companion skills (install via `./install.sh`): **`drawio-update`** (edit in place), **`drawio-from-code`** (repo → architecture), **`drawio-erd`** (schema → ERD), **`drawio-iac`** (Terraform/K8s/… → infra), **`drawio-docs`** (export into `docs/`). Hand off when the request matches those jobs instead of creating a brand-new diagram here.
 
 ## Local-only rules
 
@@ -96,15 +96,10 @@ Mermaid-authored diagrams are already laid out — don't add `--layout`.
 
 ## Mermaid and XML references (local)
 
-Before authoring, read the co-located reference files next to this `SKILL.md` (synced from the monorepo `shared/` directory — no network):
+Before authoring, read the co-located reference files next to this `SKILL.md` (no network):
 
 - `mermaid-reference.md` — Mermaid syntax for all supported diagram types plus flowchart styling (`style`, `classDef`, `linkStyle`)
 - `xml-reference.md` — draw.io XML styles, edge routing, containers, layers, tags, metadata, dark mode, well-formedness
-
-If those files are missing, fall back to the monorepo paths relative to this skill directory:
-
-- `../../../../shared/mermaid-reference.md`
-- `../../../../shared/xml-reference.md`
 
 Match the language of the diagram labels to the user's language.
 

@@ -29,7 +29,8 @@ const DEFAULT_INDEX_URL =
 const localIndexCandidates =
 [
   join(skillDir, "search-index.json"),
-  join(skillDir, "..", "..", "..", "..", "shape-search", "search-index.json"),
+  // Repo checkout: skills/drawio → ../../shape-search/search-index.json
+  join(skillDir, "..", "..", "shape-search", "search-index.json"),
 ];
 
 function printHelp()

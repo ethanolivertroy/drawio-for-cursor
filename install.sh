@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Install all draw.io Cursor skills for the current user.
-# Run from a drawio-mcp checkout:
-#   ./plugins/cursor/install.sh
+# Run from a drawio-for-cursor checkout:
+#   ./install.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SKILLS_SRC="$ROOT/plugins/cursor/skills"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+SKILLS_SRC="$ROOT/skills"
 SKILLS_DST="${HOME}/.cursor/skills"
 
 SKILLS=(
