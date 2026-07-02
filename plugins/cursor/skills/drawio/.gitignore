@@ -1,0 +1,3 @@
+# Cached shape index (~4.6 MB). Fetched on first search-shapes run when not
+# already available via the monorepo checkout. Do not commit.
+search-index.json
