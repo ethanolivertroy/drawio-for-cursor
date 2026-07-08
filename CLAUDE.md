@@ -88,6 +88,16 @@ Searches the draw.io shape library by keywords (same tool as the app server's `s
 
 **Output:** Array of matching shapes with `{style, w, h, title}` — style strings can be used directly in `mxCell` style attributes. Use only for diagrams needing industry-specific icons; skip for standard flowcharts, UML, ERD, and org charts.
 
+### `list_pages` / `get_page` / `set_page`
+
+Page-level access to a local multi-page `.drawio` file, so a large file doesn't need to be loaded whole into context just to inspect or edit one page.
+
+- **`list_pages`**: `{ path: string }` → `[{index, id, name, approxSizeBytes}]` for every page, without decompressing page content
+- **`get_page`**: `{ path: string, page: string }` (`page` is a zero-based index or exact page name) → raw `mxGraphModel` XML for that page
+- **`set_page`**: `{ path: string, page: string, content: string }` → replaces that page's content with new `mxGraphModel` XML, leaving all other pages untouched
+
+**Use case**: Call `list_pages` first on any large multi-page file to find the page you need by name/index, then `get_page`/`set_page` to work on just that page instead of the whole file.
+
 ## Quick Decision Guide
 
 | Need | Use | Reliability |

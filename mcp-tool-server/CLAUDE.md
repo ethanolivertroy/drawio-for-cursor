@@ -8,6 +8,7 @@ The original draw.io MCP server. Opens diagrams directly in the draw.io editor v
 |------|---------|
 | `src/index.js` | Single-file server (stdio transport, vanilla JS, no build step) |
 | `src/libavoid-pass.js` | Server-side libavoid edge-routing pass for `open_drawio_xml` (`routing: "libavoid"`) — parses the mxGraphModel XML, runs the shared `computeLibavoidRoutes`, writes waypoints back |
+| `src/pages.js` | Local `.drawio` file page access for `list_pages`/`get_page`/`set_page` — regex-scans `<diagram>` blocks (same tag-boundary technique as `libavoid-pass.js`), decompresses/compresses per-page with `pako` as needed |
 | `vendor/libavoid/` | Vendored libavoid-js **node** build + `libavoid.wasm` (see its README). Loaded by path in plain Node — no inlining/base64 (that's the app server's sandbox concern) |
 
 ## Tools
@@ -33,6 +34,16 @@ Opens draw.io with Mermaid.js syntax. **Recommended default** — handles flowch
 Searches the draw.io shape library (~10,000 shapes) by keywords and returns matching shapes with their exact `style` strings, dimensions, and titles — for feeding industry-specific icons (AWS, Azure, GCP, Cisco, Kubernetes, P&ID, electrical, BPMN) into `open_drawio_xml`. The algorithm is the shared `buildTagMap`/`searchShapes` (canonical in `shared/shape-search.js`, copied into `src/` by `copy-shared`), identical to the app server's.
 
 To keep the npm package lean, the ~4.6 MB `search-index.json` is **not** bundled. It is loaded lazily on the **first** `search_shapes` call and cached in memory for the process lifetime; the tag lookup map is built once at that point. An in-repo checkout reads the local `shape-search/search-index.json` (so dev and tests need no network); a published install fetches it from the CDN (`https://cdn.jsdelivr.net/gh/jgraph/drawio-mcp@main/shape-search/search-index.json`, overridable via `DRAWIO_SHAPE_INDEX_URL`). The tool is always advertised; if the index can't be loaded, the call returns a clear error instead of the tool being hidden.
+
+### `list_pages` / `get_page` / `set_page`
+
+Local-file, page-level access for large multi-page `.drawio` files, so an LLM doesn't have to load the whole file into context to inspect or edit one page.
+
+- **`list_pages(path)`** — returns `[{index, id, name, approxSizeBytes}]` for every `<diagram>` in the file. Regex-scans tag boundaries only; never decompresses page bodies, so it stays cheap even for large files.
+- **`get_page(path, page)`** — returns the raw `mxGraphModel` XML for one page (`page` is a zero-based index or the page's exact `name`), decompressing it first if that page is stored compressed.
+- **`set_page(path, page, content)`** — replaces one page's content with new `mxGraphModel` XML (`content`), re-compressing to match that page's original compression state. Every other page, and the rest of the file, is left byte-for-byte untouched.
+
+Draw.io stores each `<diagram>` body as either plain `mxGraphModel` XML or a base64(`pako.deflateRaw`) blob, independently per page — `src/pages.js` detects which per page (body starts with `<` vs. not) rather than trusting the outer `<mxfile compressed="...">` attribute, since files can mix compression states across pages. Duplicate page names are resolved by erroring with the ambiguous indices rather than guessing.
 
 ## URL Generation
 

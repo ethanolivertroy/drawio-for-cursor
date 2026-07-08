@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import pako from "pako";
 import { routeXml } from "./libavoid-pass.js";
+import { listPageMeta, readPageXml, writePageXml } from "./pages.js";
 import { spawn } from "child_process";
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
@@ -350,6 +351,85 @@ const tools =
       required: ["content"],
     },
   },
+  {
+    name: "list_pages",
+    description:
+      "Lists the pages (diagrams) in a local .drawio file without loading full page content. " +
+      "Returns each page's index, id, name, and approximate stored size in bytes. " +
+      "Call this first on large multi-page files before get_page/set_page, so only the " +
+      "page you actually need gets loaded into context.",
+    inputSchema:
+    {
+      type: "object",
+      properties:
+      {
+        path:
+        {
+          type: "string",
+          description: "Absolute or relative path to the local .drawio file.",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "get_page",
+    description:
+      "Reads one page (diagram) from a local .drawio file and returns its raw mxGraphModel " +
+      "XML, decompressing it first if the file stores that page compressed. " +
+      "Use list_pages first to find the index or name of the page you need.",
+    inputSchema:
+    {
+      type: "object",
+      properties:
+      {
+        path:
+        {
+          type: "string",
+          description: "Absolute or relative path to the local .drawio file.",
+        },
+        page:
+        {
+          type: "string",
+          description:
+            "Which page to read: a zero-based page index (e.g. \"0\") or the page's exact name as shown by list_pages.",
+        },
+      },
+      required: ["path", "page"],
+    },
+  },
+  {
+    name: "set_page",
+    description:
+      "Replaces the content of one page (diagram) in a local .drawio file with new " +
+      "mxGraphModel XML, leaving every other page in the file untouched. Compression of the " +
+      "replaced page matches whatever that page's original compression state was. " +
+      "Use list_pages/get_page first to find the target page.",
+    inputSchema:
+    {
+      type: "object",
+      properties:
+      {
+        path:
+        {
+          type: "string",
+          description: "Absolute or relative path to the local .drawio file.",
+        },
+        page:
+        {
+          type: "string",
+          description:
+            "Which page to replace: a zero-based page index (e.g. \"0\") or the page's exact name as shown by list_pages.",
+        },
+        content:
+        {
+          type: "string",
+          description: "The new page content as plain mxGraphModel XML (uncompressed).",
+        },
+      },
+      required: ["path", "page", "content"],
+    },
+  },
 ];
 
 // search_shapes is always advertised; the index is loaded lazily on first call
@@ -452,6 +532,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) =>
 
       return {
         content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      };
+    }
+
+    if (name === "list_pages" || name === "get_page" || name === "set_page")
+    {
+      const filePath = args?.path;
+
+      if (!filePath)
+      {
+        return {
+          content: [{ type: "text", text: "Error: path parameter is required" }],
+          isError: true,
+        };
+      }
+
+      if (!existsSync(filePath))
+      {
+        return {
+          content: [{ type: "text", text: `Error: file not found: ${filePath}` }],
+          isError: true,
+        };
+      }
+
+      if (name === "list_pages")
+      {
+        const fileText = readFileSync(filePath, "utf8");
+        const meta = listPageMeta(fileText);
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(meta, null, 2) }],
+        };
+      }
+
+      const page = args?.page;
+
+      if (page == null)
+      {
+        return {
+          content: [{ type: "text", text: "Error: page parameter is required" }],
+          isError: true,
+        };
+      }
+
+      if (name === "get_page")
+      {
+        const result = readPageXml(filePath, page);
+
+        return {
+          content: [{ type: "text", text: result.xml }],
+        };
+      }
+
+      const newContent = args?.content;
+
+      if (!newContent)
+      {
+        return {
+          content: [{ type: "text", text: "Error: content parameter is required" }],
+          isError: true,
+        };
+      }
+
+      const result = writePageXml(filePath, page, newContent);
+
+      return {
+        content: [{ type: "text", text: `Updated page ${result.index} ("${result.name}") in ${filePath}.` }],
       };
     }
 
